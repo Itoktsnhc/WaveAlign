@@ -105,7 +105,7 @@ func TestApp(t *testing.T) {
 	snapshot(t, tt, "0-empty")
 
 	a.addAudios([]string{a1, a2}, nil)
-	a.addClips([]string{cam1, cam2, cam3}, nil)
+	a.addClips([]string{cam1, cam2, cam3}, nil, 0)
 	ready := func() bool {
 		for _, it := range a.audios {
 			if it.loading || it.pcm == nil {
@@ -150,7 +150,7 @@ func TestApp(t *testing.T) {
 		if math.Abs(c.offset-want) > 0.002 {
 			t.Fatalf("%s at %.4f, want %.4f (confidence %.2f)", c.name(), c.offset, want, c.confidence)
 		}
-		t.Logf("%s at %.5f, confidence %.2f, drift %.1f ppm", c.name(), c.offset, c.confidence, c.driftPPM)
+		t.Logf("%s at %.5f, confidence %.2f, drift %.1f ppm", c.name(), c.offset, c.confidence, c.drift*1e6)
 	}
 	// camC overlaps camA on the one video lane: the user is told, rather
 	// than given a lane of its own.
@@ -292,6 +292,8 @@ func TestApp(t *testing.T) {
 
 	// Back to the matched place, and export both.
 	a.selectClip(a.clips[0].id)
+	tt.Wheel(200, 300, 0, 150) // the sidebar scrolls the card's buttons into view
+	tt.Advance(time.Second)    // as the wheel glides
 	tt.Frame()
 	if err := tt.Click("复位"); err != nil {
 		t.Fatal(err)

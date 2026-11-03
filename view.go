@@ -296,7 +296,7 @@ func (a *app) clipSection(c *ui.Context, t *ui.Theme) {
 			ui.Text(c, "拖入或添加 MP4 / MOV / MKV… 文件").TextColor(t.TextMuted).FontSize(12)
 		})
 		if files := drop.DroppedFiles(); files != nil {
-			a.addClips(files, nil)
+			a.addClips(files, nil, 0)
 			a.tl.fitPending = true
 		}
 		return
@@ -359,11 +359,16 @@ func (a *app) clipCard(c *ui.Context, t *ui.Theme, cl *clip) {
 					ui.Text(c, "手动 "+fmtDelta(d)).FontSize(12).TextColor(t.Warning)
 				}
 			})
-			if math.Abs(cl.driftPPM) >= 2 {
-				drift := cl.driftPPM * 1e-6 * cl.duration() * 1000
-				ui.Text(c, fmt.Sprintf("检测到时钟漂移 %+.1f ppm（全片累计约 %.0f ms，已按中点对齐）", cl.driftPPM, math.Abs(drift))).
-					FontSize(11).TextColor(t.Warning)
+			detail := fmt.Sprintf("时钟漂移 %+.1f ppm 已校正（全片约 %.1f ms）", cl.drift*1e6, math.Abs(cl.drift*cl.duration()*1000))
+			if cl.residual >= 0 {
+				detail += fmt.Sprintf(" · 逐段误差 %.3f ms", cl.residual)
 			}
+			if cl.inverted {
+				ui.Text(c, "录音与相机声音反相：试听时已自动翻转相机声音").FontSize(11).TextColor(t.Warning).
+					Tooltip("两个话筒的极性相反（接线或话筒朝向造成）。直接混合会互相抵消、听起来发空，像没对齐；试听「混合」「左右分离」时已把相机声音翻转回来。导出的录音音轨保持原样。")
+			}
+			ui.Text(c, detail).FontSize(11).TextColor(t.TextMuted).
+				Tooltip("沿整段视频每隔几秒在 48 kHz 下测一次偏移，拟合出偏移和两台设备的时钟漂移；导出和试听时按漂移对外部音频重采样，从头到尾都对齐。")
 		case cl.manual:
 			ui.Text(c, "手动放置 · 偏移 "+fmtTime(cl.offset)).FontSize(12).Font("monospace")
 		default:

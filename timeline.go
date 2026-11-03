@@ -417,7 +417,7 @@ func (a *app) drawTimeline(p *ui.Painter, r ui.Rect) {
 				}
 				p.Fill(box, bg, 4)
 				if it.peaks != nil {
-					drawWave(p, tl, r, it.peaks, it.peaks.Scale(), it.start, box, ui.Hex("#3ecf8e"))
+					drawWave(p, tl, r, it.peaks, it.peaks.Scale(), it.start, 1, box, ui.Hex("#3ecf8e"))
 				} else if it.loading {
 					p.Text(x0+8, box.Y+box.H/2-7, fmt.Sprintf("解码中 %d%%", int(it.progress*100)), 11, t.TextMuted)
 				}
@@ -444,7 +444,7 @@ func (a *app) drawTimeline(p *ui.Painter, r ui.Rect) {
 				}
 				p.Fill(box, bg, 5)
 				if c.peaks != nil {
-					drawWave(p, tl, r, c.peaks, c.peaks.Scale(), c.offset+c.lead, box, ui.Hex("#7aa2ff"))
+					drawWave(p, tl, r, c.peaks, c.peaks.Scale(), c.soundAt(), 1+c.drift, box, ui.Hex("#7aa2ff"))
 				}
 				border := ui.Hex("#3a4260")
 				if isSel {
@@ -526,17 +526,18 @@ func (a *app) drawTimeline(p *ui.Painter, r ui.Rect) {
 	}
 }
 
-// drawWave paints peaks whose first frame plays at timeline time at, inside
-// box, as a filled envelope.
-func drawWave(p *ui.Painter, tl *timeline, r ui.Rect, pk *wave.Peaks, gain float32, at float64, box ui.Rect, col ui.Color) {
+// drawWave paints peaks whose first frame plays at timeline time at, and
+// whose second lasts stretch seconds of the timeline, inside box, as a filled
+// envelope.
+func drawWave(p *ui.Painter, tl *timeline, r ui.Rect, pk *wave.Peaks, gain float32, at, stretch float64, box ui.Rect, col ui.Color) {
 	x0 := max(box.X, r.X, tl.x(at, r))
-	x1 := min(box.X+box.W, r.X+r.W, tl.x(at+float64(pk.Frames)/media.PlayRate, r))
+	x1 := min(box.X+box.W, r.X+r.W, tl.x(at+float64(pk.Frames)/media.PlayRate*stretch, r))
 	if x1 <= x0 {
 		return
 	}
 	mid := box.Y + box.H/2
 	amp := (box.H/2 - 3) * gain
-	fpp := media.PlayRate / tl.pxPerSec // frames a DIP
+	fpp := media.PlayRate / tl.pxPerSec / stretch // frames a DIP
 	step := float32(1)
 	var top, bot [][2]float32
 	flush := func() {
@@ -555,7 +556,7 @@ func drawWave(p *ui.Painter, tl *timeline, r ui.Rect, pk *wave.Peaks, gain float
 		top, bot = top[:0], bot[:0]
 	}
 	for x := x0; x < x1; x += step {
-		f := (tl.t(x-r.X) - at) * media.PlayRate
+		f := (tl.t(x-r.X) - at) * media.PlayRate / stretch
 		lo, hi, ok := pk.Range(f, f+fpp*float64(step))
 		if !ok {
 			flush()

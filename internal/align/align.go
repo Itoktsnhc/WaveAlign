@@ -294,8 +294,15 @@ func consensus(chunks []Chunk, rate int) (a, b float64) {
 // Locate finds where chunk fits best inside seg, which is longer, and returns
 // that position in samples (with a fraction) and how clearly it stands out.
 func Locate(seg, chunk []float32, beta float64) (float64, float64) {
+	pos, conf, _ := LocateSigned(seg, chunk, beta)
+	return pos, conf
+}
+
+// LocateSigned is Locate that also tells whether chunk matches seg with its
+// polarity inverted, as two microphones wired the other way round.
+func LocateSigned(seg, chunk []float32, beta float64) (pos, conf float64, inverted bool) {
 	if len(chunk) == 0 || len(seg) < len(chunk) {
-		return 0, 0
+		return 0, 0, false
 	}
 	if beta <= 0 {
 		beta = 0.8
@@ -340,11 +347,10 @@ func Locate(seg, chunk []float32, beta float64) (float64, float64) {
 	if bi < last {
 		next = math.Abs(real(out[bi+1]))
 	}
-	conf := 0.0
 	if best > 0 {
 		conf = clamp01(1 - second/best)
 	}
-	return float64(bi) + parabolic(prev, best, next), conf
+	return float64(bi) + parabolic(prev, best, next), conf, real(out[bi]) < 0
 }
 
 // phat writes into dst the cross spectrum a·conj(b) (b is given conjugated)

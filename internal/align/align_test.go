@@ -5,6 +5,8 @@ import (
 	"math/cmplx"
 	"math/rand"
 	"testing"
+
+	"wavealign/internal/dsp"
 )
 
 func TestFFTRoundTrip(t *testing.T) {
@@ -136,5 +138,55 @@ func TestLocate(t *testing.T) {
 	pos, conf := Locate(ref[rate:rate+4*rate+3000], chunk, 0)
 	if math.Abs(pos-1234) > 0.5 {
 		t.Fatalf("pos %.2f, want 1234 (conf %.2f)", pos, conf)
+	}
+}
+
+// TestTrack finds offset and drift to a fraction of a frame at 48 kHz, as a
+// recorder whose clock runs 7.9 ppm fast against a camera's.
+func TestTrack(t *testing.T) {
+	const rate = 48000
+	rng := rand.New(rand.NewSource(5))
+	ref := speechLike(rng, 400*rate, rate)
+	const a, s = 3_000_123.37, 7.9e-6 // ref frame = q frame + a + s·q frame
+	n := 250 * rate
+	q := make([]float32, n)
+	out := make([]float32, 1)
+	for i := range q {
+		dsp.At(ref, 1, 0, float64(i)+a+s*float64(i), out)
+		q[i] = out[0]
+	}
+	q = otherMic(rng, q)
+	reader := func(x []float32) Reader {
+		return func(dst []float32, frame int64) {
+			for i := range dst {
+				k := frame + int64(i)
+				dst[i] = 0
+				if k >= 0 && k < int64(len(x)) {
+					dst[i] = x[k]
+				}
+			}
+		}
+	}
+	// From a guess 1.5 ms off and without the drift, as the coarse match gives.
+	got, ok := Track(reader(ref), reader(q), int64(n), rate, Line{A: a + 72})
+	if !ok {
+		t.Fatal("not tracked")
+	}
+	if got.Inverted {
+		t.Fatal("found inverted")
+	}
+	// The same microphone wired the other way round.
+	inv := make([]float32, len(q))
+	for i, v := range q {
+		inv[i] = -v
+	}
+	if gi, ok := Track(reader(ref), reader(inv), int64(n), rate, Line{A: a + 72}); !ok || !gi.Inverted || math.Abs(gi.A-got.A) > 0.01 {
+		t.Fatalf("inverted: ok %v inverted %v a %.3f", ok, gi.Inverted, gi.A)
+	}
+	t.Logf("a %.3f (want %.3f), drift %.3f ppm, rms %.3f frames, %d/%d excerpts", got.A, a, got.S*1e6, got.RMS, got.Used, got.Windows)
+	for _, at := range []float64{0, float64(n) / 2, float64(n)} {
+		if d := got.Lag(at) - (a + s*at); math.Abs(d) > 0.1*rate/1000 {
+			t.Fatalf("off by %.3f ms at frame %.0f", d/rate*1000, at)
+		}
 	}
 }

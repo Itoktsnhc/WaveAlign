@@ -58,7 +58,7 @@ func (a *app) addFiles(paths []string) {
 		}
 	}
 	a.addAudios(au, nil)
-	a.addClips(vi, nil)
+	a.addClips(vi, nil, 0)
 }
 
 // addAudios appends files to the external audio; saved, when given, restores
@@ -78,15 +78,18 @@ func (a *app) addAudios(paths []string, saved []projectAudio) {
 	a.sourcesChanged()
 }
 
-// addClips adds videos; saved, when given, restores their streams and places.
-func (a *app) addClips(paths []string, saved []projectClip) {
+// addClips adds videos; saved, when given, restores their streams and places
+// as a project of the version saved them.
+func (a *app) addClips(paths []string, saved []projectClip, version int) {
 	for i, p := range paths {
 		c := &clip{source: source{id: a.newID(), path: p, loading: true, stream: -1}}
 		want := -1
 		if saved != nil {
 			s := saved[i]
 			want, c.channel, c.offset, c.aligned, c.manual = s.Stream, s.Channel, s.Offset, s.Aligned, s.Placed
-			c.autoOffset, c.confidence, c.driftPPM = s.AutoOffset, s.Confidence, s.DriftPPM
+			c.autoOffset, c.confidence, c.drift, c.residual = s.AutoOffset, s.Confidence, s.DriftPPM*1e-6, s.Residual
+			c.legacy = version < 2 && c.drift != 0
+			c.inverted = s.Inverted
 		}
 		c.want = want
 		a.clips = append(a.clips, c)
@@ -99,6 +102,13 @@ func (a *app) addClips(paths []string, saved []projectClip) {
 			}
 			if c.channel > c.channels() {
 				c.channel = 0
+			}
+			if c.legacy {
+				// Version 1 placed the clip's middle, without the drift.
+				d := c.drift * info.Duration / 2
+				c.offset -= d
+				c.autoOffset -= d
+				c.legacy = false
 			}
 		})
 	}
@@ -381,12 +391,41 @@ func (a *app) alignClips(ids []int) {
 	if a.extKey != key.String() {
 		cached = nil
 	}
+	// The decoded audio, at 48 kHz, for measuring along each clip.
+	type extSeg struct {
+		pcm   *media.PCM
+		start int64
+	}
+	var segs []extSeg
+	for _, it := range a.audios {
+		if it.pcm != nil {
+			segs = append(segs, extSeg{it.pcm, int64(math.Round(it.start * media.PlayRate))})
+		}
+	}
+	extCh := a.channel
+	if extCh > 2 {
+		extCh = 0 // the decoded audio is stereo: match the mix
+	}
+	extRead := func(dst []float32, frame int64) {
+		clear(dst)
+		tmp := make([]float32, len(dst))
+		for _, s := range segs {
+			from, to := max(frame, s.start), min(frame+int64(len(dst)), s.start+s.pcm.Frames)
+			if to <= from {
+				continue
+			}
+			t := tmp[:to-from]
+			s.pcm.ReadMono(t, from-s.start, extCh)
+			copy(dst[from-frame:], t)
+		}
+	}
 	type job struct {
 		c       *clip
 		path    string
 		stream  int
 		channel int
 		lead    float64
+		pcm     *media.PCM
 	}
 	var jobs []job
 	for _, id := range ids {
@@ -399,7 +438,7 @@ func (a *app) alignClips(ids []int) {
 			continue
 		}
 		c.aligning, c.alignProg, c.err = true, 0, ""
-		jobs = append(jobs, job{c, c.path, st.Index, c.channel, c.lead})
+		jobs = append(jobs, job{c, c.path, st.Index, c.channel, c.lead, c.pcm})
 	}
 	if len(jobs) == 0 {
 		return
@@ -439,9 +478,28 @@ func (a *app) alignClips(ids []int) {
 				res, err = align.Find(ext, q, align.Options{Rate: media.AnalysisRate, Progress: func(f float64) {
 					if time.Since(last) > 100*time.Millisecond {
 						last = time.Now()
-						a.post(func() { j.c.alignProg = f })
+						a.post(func() { j.c.alignProg = 0.8 * f })
 					}
 				}})
+			}
+			// Then measure along the whole clip at 48 kHz, to a fraction of
+			// a sample, for the offset and the drift between the clocks.
+			const rate = media.PlayRate
+			line := align.Line{A: res.LagAt(0) * rate, S: res.Slope}
+			residual := -1.0
+			inverted := false
+			if err == nil && j.pcm != nil {
+				a.post(func() { j.c.alignProg = 0.85 })
+				ch := j.channel
+				if ch > 2 {
+					ch = 0
+				}
+				clipRead := func(dst []float32, frame int64) { j.pcm.ReadMono(dst, frame, ch) }
+				if tr, ok := align.Track(extRead, clipRead, j.pcm.Frames, rate, line); ok {
+					line = tr.Line
+					residual = tr.RMS / rate * 1000
+					inverted = tr.Inverted
+				}
 			}
 			if err == nil {
 				ok++
@@ -453,11 +511,15 @@ func (a *app) alignClips(ids []int) {
 					c.err = "匹配失败: " + err.Error()
 					return
 				}
-				c.offset = res.Lag - j.lead
+				// The clip's sound starts lead after its picture, and line
+				// maps the sound's frames onto the timeline's.
+				c.drift = line.S
+				c.offset = line.A/rate - j.lead*(1+c.drift)
 				c.autoOffset = c.offset
 				c.aligned = true
 				c.confidence = res.Confidence
-				c.driftPPM = res.Slope * 1e6
+				c.residual = residual
+				c.inverted = inverted
 				a.clipMoved()
 			})
 		}
@@ -498,7 +560,11 @@ func (a *app) segmentsB(origin float64) []playback.Segment {
 		if c.pcm == nil || !c.placed() || a.onlySel && a.selected != 0 && c.id != a.selected {
 			continue
 		}
-		out = append(out, playback.Segment{PCM: c.pcm, Start: int64(math.Round((c.offset + c.lead - origin) * playback.Rate))})
+		gain := float32(1)
+		if c.inverted {
+			gain = -1
+		}
+		out = append(out, playback.Segment{PCM: c.pcm, Start: (c.soundAt() - origin) * playback.Rate, Step: 1 / (1 + c.drift), Gain: gain})
 	}
 	return out
 }
@@ -509,7 +575,7 @@ func (a *app) play() {
 	var segA []playback.Segment
 	for _, it := range a.audios {
 		if it.pcm != nil {
-			segA = append(segA, playback.Segment{PCM: it.pcm, Start: int64(math.Round((it.start - lo) * playback.Rate))})
+			segA = append(segA, playback.Segment{PCM: it.pcm, Start: math.Round((it.start - lo) * playback.Rate), Step: 1})
 		}
 	}
 	if a.playhead >= hi || a.playhead < lo {
@@ -646,7 +712,7 @@ func (a *app) startExport() {
 		return
 	}
 	var inputs []media.AudioInput
-	rate, layout := 0, ""
+	rate, layout, channels := 0, "", 0
 	sameRate := true
 	for i, it := range a.audios {
 		st, ok := it.audioStream()
@@ -656,11 +722,8 @@ func (a *app) startExport() {
 		}
 		inputs = append(inputs, media.AudioInput{Path: it.path, Stream: st.Index})
 		if i == 0 {
-			rate = st.SampleRate
-			layout = st.Layout
-			if layout == "" {
-				layout = strconv.Itoa(st.Channels) + "c"
-			}
+			rate, channels = st.SampleRate, st.Channels
+			layout = media.Layout(st.Layout, st.Channels)
 		} else if st.SampleRate != rate {
 			sameRate = false
 		}
@@ -677,9 +740,9 @@ func (a *app) startExport() {
 	}
 	switch a.cfg.Layout {
 	case 1:
-		layout = "stereo"
+		layout, channels = "stereo", 2
 	case 2:
-		layout = "mono"
+		layout, channels = "mono", 1
 	}
 	codec := []string{media.CodecAAC, media.CodecPCM, media.CodecFLAC}[a.cfg.Codec]
 	type job struct {
@@ -701,8 +764,8 @@ func (a *app) startExport() {
 		out := uniquePath(filepath.Join(dir, base+ext), c.path)
 		c.exporting, c.exportProg, c.exported, c.exportErr = true, 0, "", ""
 		jobs = append(jobs, job{c, media.ExportOptions{
-			Video: c.path, Output: out, Inputs: inputs, Offset: c.offset, Duration: c.info.Duration,
-			SampleRate: rate, Layout: layout, Codec: codec, Bitrate: "320k", KeepOriginal: a.cfg.KeepOrig,
+			Video: c.path, Output: out, Inputs: inputs, Offset: c.offset, Drift: c.drift, Duration: c.info.Duration,
+			SampleRate: rate, Layout: layout, Channels: channels, Codec: codec, Bitrate: "320k", KeepOriginal: a.cfg.KeepOrig,
 		}})
 	}
 	a.cfg.save()
@@ -795,7 +858,7 @@ func (a *app) chooseVideos() {
 		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{Parent: a.win, Title: "添加视频（匹配源 2）", Multiple: true,
 			Filters: []mygo.FileFilter{videoFilter, allFilter}})
 		if err == nil && len(paths) > 0 {
-			a.post(func() { a.addClips(paths, nil) })
+			a.post(func() { a.addClips(paths, nil, 0) })
 		}
 	}()
 }
@@ -835,7 +898,7 @@ func (a *app) configureFFmpeg() {
 
 // snapshot is the project as Save writes it.
 func (a *app) snapshot() project {
-	p := project{Version: 1, Channel: a.channel}
+	p := project{Version: 2, Channel: a.channel}
 	stream := func(s *source) int {
 		if st, ok := s.audioStream(); ok {
 			return st.Index
@@ -848,7 +911,7 @@ func (a *app) snapshot() project {
 	for _, c := range a.clips {
 		p.Clips = append(p.Clips, projectClip{Path: c.path, Stream: stream(&c.source), Channel: c.channel,
 			Offset: c.offset, Aligned: c.aligned, Placed: c.manual, AutoOffset: c.autoOffset,
-			Confidence: c.confidence, DriftPPM: c.driftPPM})
+			Confidence: c.confidence, DriftPPM: c.drift * 1e6, Residual: c.residual, Inverted: c.inverted})
 	}
 	return p
 }
@@ -985,7 +1048,7 @@ func (a *app) loadProject(p project) {
 		cp = append(cp, x.Path)
 	}
 	a.addAudios(ap, p.Audios)
-	a.addClips(cp, p.Clips)
+	a.addClips(cp, p.Clips, p.Version)
 	a.tl.fitPending = true
 }
 

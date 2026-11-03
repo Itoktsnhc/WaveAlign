@@ -84,9 +84,18 @@ type clip struct {
 	manual     bool    // placed on the timeline by hand, unmatched
 	autoOffset float64 // what matching found
 	confidence float64
-	driftPPM   float64
-	aligning   bool
-	alignProg  float64
+	// drift is how much faster the recorder's clock runs than the camera's:
+	// the clip's second τ falls on offset + τ·(1+drift) of the timeline.
+	drift float64
+	// residual is how far, in milliseconds, the excerpts measured along the
+	// clip stay from the fitted offset and drift; -1 when not measured.
+	residual float64
+	legacy   bool // offset saved by version 1, at the clip's middle
+	// inverted says the clip's sound has the recorder's polarity turned
+	// over; monitoring turns it back, so the two compare in phase.
+	inverted  bool
+	aligning  bool
+	alignProg float64
 
 	exporting  bool
 	exportProg float64
@@ -94,7 +103,11 @@ type clip struct {
 	exportErr  string
 }
 
-func (c *clip) end() float64 { return c.offset + c.duration() }
+func (c *clip) end() float64 { return c.offset + c.duration()*(1+c.drift) }
+
+// soundAt is where the clip's sound starts on the timeline: its audio stream
+// may start after its picture.
+func (c *clip) soundAt() float64 { return c.offset + c.lead*(1+c.drift) }
 
 // placed reports whether the clip is on the timeline: matched, or placed by
 // hand. Clips not yet matched wait in the sidebar.
@@ -259,4 +272,6 @@ type projectClip struct {
 	AutoOffset float64 `json:"autoOffset"`
 	Confidence float64 `json:"confidence"`
 	DriftPPM   float64 `json:"driftPPM"`
+	Residual   float64 `json:"residualMs,omitempty"`
+	Inverted   bool    `json:"inverted,omitempty"`
 }

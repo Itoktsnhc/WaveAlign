@@ -96,7 +96,7 @@ func TestPipeline(t *testing.T) {
 		out := filepath.Join(dir, "out-"+codec+OutputExt(".mp4", codec))
 		err = Export(ctx, ExportOptions{
 			Video: clip, Output: out, Inputs: inputs, Offset: offset, Duration: info.Duration,
-			SampleRate: 48000, Layout: "stereo", Codec: codec, KeepOriginal: true,
+			SampleRate: 48000, Layout: "stereo", Channels: 2, Codec: codec, KeepOriginal: true,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -136,7 +136,7 @@ func TestPipeline(t *testing.T) {
 	out := filepath.Join(dir, "early.mp4")
 	err = Export(ctx, ExportOptions{
 		Video: clip, Output: out, Inputs: inputs, Offset: -2, Duration: info.Duration,
-		SampleRate: 48000, Layout: "mono", Codec: CodecAAC,
+		SampleRate: 48000, Layout: "mono", Channels: 1, Codec: CodecAAC,
 	})
 	if err != nil {
 		t.Fatal(err)

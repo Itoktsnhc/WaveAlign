@@ -4,8 +4,10 @@ package playback
 
 import (
 	"io"
+	"math"
 	"sync"
 
+	"wavealign/internal/dsp"
 	"wavealign/internal/media"
 )
 
@@ -22,10 +24,17 @@ const (
 	Split                // the external audio left, the videos' sound right
 )
 
-// Segment is decoded audio placed on the mix's timeline.
+// Segment is decoded audio placed on the mix's timeline: mix frame f plays
+// its frame (f - Start)·Step. Step is 1 for the external audio, and a hair
+// off 1 for a video whose clock drifts from the recorder's, which the mix
+// follows by resampling it.
 type Segment struct {
 	PCM   *media.PCM
-	Start int64 // the mix frame its first frame plays at
+	Start float64
+	Step  float64
+	// Gain scales it; 0 is 1. -1 turns over its polarity, so that a camera
+	// wired the other way round from the recorder compares in phase.
+	Gain float32
 }
 
 // Params are the mix's settings, changed as it plays.
@@ -43,6 +52,7 @@ type Mix struct {
 	pos    int64
 	p      Params
 	ta, tb []float32
+	src    []float32
 }
 
 // NewMix makes a mix of frames frames.
@@ -94,8 +104,8 @@ func (m *Mix) Read(buf []float32) (int, error) {
 		m.tb = make([]float32, len(out))
 	}
 	ta, tb := m.ta[:len(out)], m.tb[:len(out)]
-	hasA := m.p.Mode != Original && sum(m.a, m.pos, n, ta)
-	hasB := m.p.Mode != External && sum(m.b, m.pos, n, tb)
+	hasA := m.p.Mode != Original && m.sum(m.a, m.pos, n, ta)
+	hasB := m.p.Mode != External && m.sum(m.b, m.pos, n, tb)
 	ga, gb := m.p.GainA, m.p.GainB
 	for i := 0; i < len(out); i += 2 {
 		var l, r float32
@@ -123,28 +133,44 @@ func (m *Mix) Read(buf []float32) (int, error) {
 	return len(out), nil
 }
 
-// sum adds into dst the segments' frames [pos, pos+n), reporting whether any
-// was there.
-func sum(segs []Segment, pos, n int64, dst []float32) bool {
+// sum adds into dst the segments' sound for mix frames [pos, pos+n),
+// reporting whether any was there.
+func (m *Mix) sum(segs []Segment, pos, n int64, dst []float32) bool {
 	clear(dst)
 	any := false
-	var tmp []float32
+	frame := make([]float32, 2)
 	for _, s := range segs {
-		from, to := max(pos, s.Start), min(pos+n, s.Start+s.PCM.Frames)
-		if to <= from {
+		step := s.Step
+		if step == 0 {
+			step = 1
+		}
+		// The segment's frames these mix frames take.
+		x0 := (float64(pos) - s.Start) * step
+		x1 := (float64(pos+n) - s.Start) * step
+		if x1 <= 0 || x0 >= float64(s.PCM.Frames) {
 			continue
 		}
-		k := to - from
-		if cap(tmp) < int(2*k) {
-			tmp = make([]float32, 2*k)
-		}
-		t := tmp[:2*k]
-		s.PCM.Read(t, from-s.Start)
-		off := 2 * (from - pos)
-		for i, v := range t {
-			dst[off+int64(i)] += v
-		}
 		any = true
+		gain := s.Gain
+		if gain == 0 {
+			gain = 1
+		}
+		lo := int64(math.Floor(x0)) - dsp.Taps
+		hi := int64(math.Ceil(x1)) + dsp.Taps
+		if cap(m.src) < int(2*(hi-lo)) {
+			m.src = make([]float32, 2*(hi-lo))
+		}
+		src := m.src[:2*(hi-lo)]
+		s.PCM.Read(src, lo)
+		for i := int64(0); i < n; i++ {
+			x := (float64(pos+i) - s.Start) * step
+			if x < -dsp.Taps || x >= float64(s.PCM.Frames)+dsp.Taps {
+				continue
+			}
+			dsp.At(src, 2, lo, x, frame)
+			dst[2*i] += gain * frame[0]
+			dst[2*i+1] += gain * frame[1]
+		}
 	}
 	return any
 }
