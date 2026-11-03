@@ -54,6 +54,26 @@ go test ./...         # 单元测试 + 用 ffmpeg 生成素材的端到端测试
 
 `go tool mygo build` 生成 Windows 安装包时会下载 NSIS；如果网络不通，可只用 `go build -o WaveAlign.exe .` 得到可执行文件。
 
+## 发布（GitHub Actions）
+
+推送 `v` 开头的标签即自动发布：
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) 会依次：
+
+1. 在 Windows runner 上下载 ffmpeg，运行 `go vet` 和全部测试（runner 没有 GPU 和声卡：GPU 测试跳过，预览回退 CPU）；
+2. 在 Ubuntu runner 上交叉编译 Windows 版（无 cgo），版本号取自标签（`v0.2.0` → `0.2.0`，写入 `mygo.json`）；
+3. 创建 GitHub Release，附带：
+   - `WaveAlign-<版本>-windows-amd64.zip`：便携版，附带 gyan.dev 的 ffmpeg / ffprobe（在 `ffmpeg\bin`，程序自动找到）；
+   - `WaveAlign-<版本>-windows-amd64-setup.exe`：安装包，不含 ffmpeg；
+   - `SHA256SUMS.txt`。
+
+标签带连字符（如 `v0.2.0-beta.1`）时发布为预发布版本；格式不对的标签会直接失败。在 Actions 页面手动运行（workflow_dispatch）只构建，产物在运行结果里下载，不创建 Release。程序未做代码签名，Windows SmartScreen 首次运行可能提示。
+
 ## 代码结构
 
 | 路径 | 内容 |

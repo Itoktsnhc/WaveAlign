@@ -1,0 +1,144 @@
+# Pushing a tag such as v0.2.0 tests the app, builds it for Windows and
+# publishes a GitHub release with:
+#   - WaveAlign-<version>-windows-amd64-setup.exe   the installer
+#   - WaveAlign-<version>-windows-amd64.zip         portable, with ffmpeg/ffprobe
+#   - SHA256SUMS.txt
+# The version comes from the tag (v0.2.0 → 0.2.0); a tag with a hyphen, as
+# v0.2.0-beta.1, makes a prerelease. Running the workflow by hand builds the
+# same files as artifacts of the run, without a release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # creates the release and uploads to it
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The ffmpeg bundled in the portable zip, and used by the tests:
+  # gyan.dev's release build, which has NVDEC/CUDA, D3D11VA and QSV.
+  FFMPEG_URL: https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+
+jobs:
+  test:
+    name: Test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install ffmpeg
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:FFMPEG_URL -OutFile "$env:RUNNER_TEMP\ffmpeg.zip"
+          Expand-Archive "$env:RUNNER_TEMP\ffmpeg.zip" -DestinationPath "$env:RUNNER_TEMP\ffmpeg"
+          $bin = (Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
+          Add-Content $env:GITHUB_PATH $bin
+      - name: ffmpeg version
+        run: ffmpeg -hide_banner -version
+      - run: go vet ./...
+      # Runners have no GPU and no audio device: the GPU tests skip, the
+      # preview falls back to the CPU, and playback runs unheard.
+      - run: go test -timeout 15m ./...
+
+  build:
+    name: Build (Windows)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install NSIS, for the installer
+        run: sudo apt-get update && sudo apt-get install -y nsis zip jq
+
+      - name: Version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::标签 $GITHUB_REF_NAME 不是 v<主>.<次>.<修订>[-预发布] 格式"
+              exit 1
+            fi
+          else
+            version="$(jq -r .version mygo.json)-dev.${GITHUB_RUN_NUMBER}"
+          fi
+          jq --arg v "$version" '.version = $v' mygo.json > mygo.json.tmp && mv mygo.json.tmp mygo.json
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "WaveAlign $version"
+
+      # MyGo needs no cgo: Ubuntu builds the Windows app and its installer.
+      - name: Build
+        run: go tool mygo build -platform windows/amd64
+
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          out=build/windows-amd64
+          ls -la "$out"
+          pkg="WaveAlign-$VERSION-windows-amd64"
+          mkdir -p "dist/$pkg/ffmpeg/bin"
+
+          # The app and what mygo build put beside it, but the installer.
+          find "$out" -maxdepth 1 -type f ! -name '*-setup-*.exe' -exec cp {} "dist/$pkg/" \;
+          cp README.md "dist/$pkg/"
+
+          # ffmpeg and ffprobe, which the app finds in ffmpeg/bin beside it.
+          curl -fsSL "$FFMPEG_URL" -o "$RUNNER_TEMP/ffmpeg.zip"
+          unzip -q "$RUNNER_TEMP/ffmpeg.zip" -d "$RUNNER_TEMP/ffmpeg"
+          src="$(dirname "$(find "$RUNNER_TEMP/ffmpeg" -name ffmpeg.exe | head -1)")/.."
+          cp "$src/bin/ffmpeg.exe" "$src/bin/ffprobe.exe" "dist/$pkg/ffmpeg/bin/"
+          cp "$src/LICENSE" "dist/$pkg/ffmpeg/LICENSE.txt"
+          ffver="$(basename "$(cd "$src" && pwd)")"
+          printf 'ffmpeg: %s\nfrom: %s\nsource: https://ffmpeg.org/download.html\nbuilds: https://www.gyan.dev/ffmpeg/builds/\n' \
+            "$ffver" "$FFMPEG_URL" > "dist/$pkg/ffmpeg/README.txt"
+
+          (cd dist && zip -qr9 "$pkg.zip" "$pkg" && rm -rf "$pkg")
+          cp "$out"/*-setup-*.exe "dist/WaveAlign-$VERSION-windows-amd64-setup.exe"
+          (cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          echo "FFMPEG_BUILD=$ffver" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: WaveAlign-${{ steps.version.outputs.version }}-windows-amd64
+          path: dist/*
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          ## 下载
+
+          | 文件 | 说明 |
+          | --- | --- |
+          | \`WaveAlign-$VERSION-windows-amd64.zip\` | 便携版，解压即用，已附带 ffmpeg / ffprobe（$FFMPEG_BUILD） |
+          | \`WaveAlign-$VERSION-windows-amd64-setup.exe\` | 安装包，不含 ffmpeg：请自备 ffmpeg 并加入 PATH，或在「设置」中指定目录 |
+          | \`SHA256SUMS.txt\` | 校验和 |
+
+          需要 Windows 10/11 x64。NVIDIA 显卡上预览画面用 NVDEC + CUDA 解码缩放，其他显卡自动回退 D3D11 或 CPU。程序未签名，首次运行时 SmartScreen 可能提示，选择「仍要运行」即可。
+          EOF
+
+          args=(--repo "$GITHUB_REPOSITORY")
+          if gh release view "$GITHUB_REF_NAME" "${args[@]}" > /dev/null 2>&1; then
+            # Run again: replace the files of the release that exists.
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber "${args[@]}"
+          else
+            flags=(--title "WaveAlign $GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes --verify-tag)
+            if [[ "$VERSION" == *-* ]]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}" "${args[@]}"
+          fi
