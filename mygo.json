@@ -1,0 +1,6 @@
+{
+  "name": "WaveAlign",
+  "identifier": "dev.wavealign.app",
+  "version": "0.1.0",
+  "out": "build"
+}
