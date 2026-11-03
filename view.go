@@ -15,13 +15,15 @@ func (a *app) view(c *ui.Context) {
 	c.SetTheme(a.theme)
 	t := c.Theme()
 	a.tick()
+	a.held = c.Modifiers()
+	_, a.tl.end = a.timeRange()
+	a.tl.clamp()
 	if a.playing {
 		c.AnimationFrame()
 		a.tl.follow(a.playhead)
 	}
 	if a.tl.fitPending && a.tl.width > 0 && (len(a.audios) > 0 || len(a.clips) > 0) {
-		lo, hi := a.timeRange()
-		a.tl.fit(lo, hi)
+		a.tl.fit()
 		a.tl.fitPending = false
 	}
 	a.shortcuts(c)
@@ -48,6 +50,25 @@ func (a *app) view(c *ui.Context) {
 	})
 	a.exportDialog(c)
 	a.settingsDialog(c)
+	a.conflictDialog(c)
+}
+
+// conflictDialog tells, after matching, which videos landed on the same
+// stretch of the timeline.
+func (a *app) conflictDialog(c *ui.Context) {
+	if !a.conflictOpen {
+		return
+	}
+	msg := describeConflicts(a.conflictList) +
+		"\n视频只有一条轨道。重叠可能是匹配错误（看置信度、试听确认），也可能这些视频本来就拍摄于同一时段（多机位）。" +
+		"请微调、重新对齐或移除其中一个；冲突处在时间轴上以红色标出。"
+	switch ui.AlertDialog(c, &a.conflictOpen, fmt.Sprintf("%d 处时间轴冲突", len(a.conflictList)), msg, "知道了", "查看第一处") {
+	case 1:
+		k := a.conflictList[0]
+		a.selectClip(k.b.id)
+		a.tl.reveal(math.Min(k.a.offset, k.b.offset), math.Max(k.a.end(), k.b.end()))
+		a.seek(k.from)
+	}
 }
 
 func (a *app) shortcuts(c *ui.Context) {
@@ -55,14 +76,17 @@ func (a *app) shortcuts(c *ui.Context) {
 		a.togglePlay()
 	}
 	if c.Shortcut(ui.Cmd, ui.KeyS) {
-		a.saveProject()
+		a.saveProject(false, nil)
+	}
+	if c.Shortcut(ui.Cmd|ui.Shift, ui.KeyS) {
+		a.saveProject(true, nil)
 	}
 	if c.Shortcut(ui.Cmd, ui.KeyO) {
 		a.openProject()
 	}
 	if c.Shortcut(0, ui.KeyHome) {
 		lo, _ := a.timeRange()
-		if cl := a.selectedClip(); cl != nil {
+		if cl := a.selectedClip(); cl != nil && cl.placed() {
 			lo = cl.offset
 		}
 		a.seek(lo)
@@ -106,7 +130,8 @@ func (a *app) toolbar(c *ui.Context) {
 		ui.Button(c, "导出…").Disabled(len(a.clips) == 0 || len(a.audios) == 0).OnClick(func() { a.exportOpen = true })
 		ui.Spacer(c)
 		ui.Button(c, "打开工程").OnClick(a.openProject)
-		ui.Button(c, "保存工程").Disabled(len(a.clips) == 0 && len(a.audios) == 0).OnClick(a.saveProject)
+		ui.Button(c, "保存工程").Disabled(len(a.clips) == 0 && len(a.audios) == 0).
+			Tooltip("Ctrl+S；Ctrl+Shift+S 另存为").OnClick(func() { a.saveProject(false, nil) })
 		ui.Button(c, "设置").OnClick(func() { a.settingsOpen = true })
 	})
 }
@@ -123,7 +148,13 @@ func (a *app) statusBar(c *ui.Context) {
 			msg = "把音频和视频文件拖进窗口，或用工具栏添加。空格 播放/暂停 · ←/→ 微调 1 帧 · Shift ±10ms · Alt ±1ms"
 		}
 		ui.Text(c, msg).FontSize(12).TextColor(col).SingleLine().Grow(1)
-		hw := map[string]string{"auto": "自动", "cuda": "NVDEC", "d3d11va": "D3D11", "none": "CPU"}[a.hwaccel()]
+		hw := media.DecodeLabel(a.prev.mode)
+		if a.prev.mode == "" {
+			hw = "待检测（" + hwLabels[max(indexOf(hwValues, a.cfg.HWAccel), 0)] + "）"
+		}
+		if n := len(a.conflicts()); n > 0 {
+			ui.Text(c, fmt.Sprintf("时间轴冲突 %d 处", n)).FontSize(12).TextColor(t.Danger)
+		}
 		ui.Text(c, "预览解码: "+hw).FontSize(12).TextColor(t.TextMuted)
 	})
 }
@@ -310,6 +341,8 @@ func (a *app) clipCard(c *ui.Context, t *ui.Theme, cl *clip) {
 			ui.Text(c, cl.err).FontSize(12).TextColor(t.Danger)
 		case cl.aligning:
 			ui.Progress(c, cl.alignProg)
+		case cl.loading && cl.info != nil:
+			ui.Text(c, "解码音轨中，完成后可匹配").FontSize(12).TextColor(t.TextMuted)
 		case cl.aligned:
 			conf := int(cl.confidence*100 + 0.5)
 			col := t.Success
@@ -331,8 +364,21 @@ func (a *app) clipCard(c *ui.Context, t *ui.Theme, cl *clip) {
 				ui.Text(c, fmt.Sprintf("检测到时钟漂移 %+.1f ppm（全片累计约 %.0f ms，已按中点对齐）", cl.driftPPM, math.Abs(drift))).
 					FontSize(11).TextColor(t.Warning)
 			}
+		case cl.manual:
+			ui.Text(c, "手动放置 · 偏移 "+fmtTime(cl.offset)).FontSize(12).Font("monospace")
 		default:
-			ui.Text(c, "未匹配 · 偏移 "+fmtTime(cl.offset)).FontSize(12).TextColor(t.TextMuted)
+			ui.Text(c, "未匹配，尚未放到时间轴").FontSize(12).TextColor(t.TextMuted)
+		}
+		if cs := a.conflictsOf(cl); len(cs) > 0 {
+			other := cs[0].a
+			if other == cl {
+				other = cs[0].b
+			}
+			msg := fmt.Sprintf("与 %s 重叠 %.1f 秒", other.name(), cs[0].to-cs[0].from)
+			if len(cs) > 1 {
+				msg += fmt.Sprintf(" 等 %d 处", len(cs))
+			}
+			ui.Text(c, msg).FontSize(12).TextColor(t.Danger).SingleLine().Tooltip(describeConflicts(cs))
 		}
 		if cl.exporting {
 			ui.Progress(c, cl.exportProg)
@@ -344,15 +390,22 @@ func (a *app) clipCard(c *ui.Context, t *ui.Theme, cl *clip) {
 		ui.Row(c).Gap(6).Children(func() {
 			ui.Button(c, "对齐").Disabled(cl.aligning || len(cl.streams) == 0 || cl.loading || len(a.audios) == 0).
 				OnClick(func() { a.alignClips([]int{cl.id}) })
-			ui.Button(c, "定位").Tooltip("在时间轴上显示并跳到片头").OnClick(func() {
+			if !cl.placed() {
+				ui.Button(c, "放到播放头").Disabled(cl.info == nil).
+					Tooltip("不自动匹配，手动把视频放到播放头处，再在时间轴上微调").
+					OnClick(func() { a.placeAtPlayhead(cl) })
+			}
+			ui.Button(c, "定位").Disabled(!cl.placed()).Tooltip("在时间轴上显示并跳到片头").OnClick(func() {
 				a.selectClip(cl.id)
 				a.tl.reveal(cl.offset, cl.end())
 				a.seek(cl.offset)
 			})
-			ui.Button(c, "复位").Disabled(!cl.aligned || cl.offset == cl.autoOffset).Tooltip("回到自动匹配的位置").OnClick(func() {
-				cl.offset = cl.autoOffset
-				a.clipMoved()
-			})
+			if cl.placed() {
+				ui.Button(c, "复位").Disabled(!cl.aligned || cl.offset == cl.autoOffset).Tooltip("回到自动匹配的位置").OnClick(func() {
+					cl.offset = cl.autoOffset
+					a.clipMoved()
+				})
+			}
 			ui.Spacer(c)
 			ui.Button(c, "移除").OnClick(func() { a.removeClip(cl.id) })
 		})
@@ -386,7 +439,7 @@ func (a *app) previewView(c *ui.Context) {
 			}
 			ui.PrimaryButton(c, label).Width(96).Tooltip("空格").OnClick(a.togglePlay)
 			ui.Button(c, "⏮").Tooltip("到选中视频的片头（Home）").OnClick(func() {
-				if cl := a.selectedClip(); cl != nil {
+				if cl := a.selectedClip(); cl != nil && cl.placed() {
 					a.seek(cl.offset)
 				} else {
 					lo, _ := a.timeRange()
@@ -423,9 +476,9 @@ func (a *app) timelinePanel(c *ui.Context) {
 	ui.Column(c).Fill().Children(func() {
 		ui.Row(c).Padding(6, 10).Gap(6).Children(func() {
 			cl := a.selectedClip()
-			if cl == nil {
+			if cl == nil || !cl.placed() {
 				ui.Text(c, "时间轴").Bold()
-				ui.Text(c, "选中一个视频后可以微调它的位置").FontSize(12).TextColor(t.TextMuted)
+				ui.Text(c, "选中时间轴上的视频后可以微调它的位置").FontSize(12).TextColor(t.TextMuted)
 			} else {
 				ui.Text(c, cl.name()).Bold().SingleLine().MaxWidth(220).Tooltip(cl.path)
 				ui.Text(c, "偏移(秒)").FontSize(12).TextColor(t.TextMuted)
@@ -443,13 +496,10 @@ func (a *app) timelinePanel(c *ui.Context) {
 				}
 			}
 			ui.Spacer(c)
-			ui.Text(c, "滚轮平移 · Ctrl+滚轮缩放 · Shift+滚轮上下 · 拖片段微调（Shift 精细）").FontSize(11).TextColor(t.TextMuted).SingleLine()
+			ui.Text(c, "滚轮 / Ctrl+滚轮 / Alt+滚轮 缩放 · Shift+滚轮或拖滚动条平移 · 拖片段微调（Shift 精细）").FontSize(11).TextColor(t.TextMuted).SingleLine()
 			ui.Button(c, "−").Tooltip("缩小").OnClick(func() { a.tl.zoom(1/1.6, a.tl.width/2) })
 			ui.Button(c, "+").Tooltip("放大").OnClick(func() { a.tl.zoom(1.6, a.tl.width/2) })
-			ui.Button(c, "全部").Tooltip("缩放到全部内容").OnClick(func() {
-				lo, hi := a.timeRange()
-				a.tl.fit(lo, hi)
-			})
+			ui.Button(c, "全部").Tooltip("缩放到全部内容").OnClick(a.tl.fit)
 		})
 		canvas := ui.Box(c).Grow(1).FillWidth().Clip()
 		if b := canvas.Bounds(); b.W > 0 {
@@ -553,7 +603,7 @@ func (a *app) exportDialog(c *ui.Context) {
 	})
 }
 
-var hwLabels = []string{"自动", "NVIDIA NVDEC (CUDA)", "Direct3D 11", "关闭（CPU 解码）"}
+var hwLabels = []string{"自动（GPU 优先）", "NVIDIA：NVDEC + CUDA 缩放", "Direct3D 11 解码", "关闭（CPU 解码）"}
 var hwValues = []string{"auto", "cuda", "d3d11va", "none"}
 
 func (a *app) settingsDialog(c *ui.Context) {
@@ -576,14 +626,14 @@ func (a *app) settingsDialog(c *ui.Context) {
 			ui.Text(c, found).FontSize(11).TextColor(t.TextMuted)
 			cur := hwLabels[max(indexOf(hwValues, a.cfg.HWAccel), 0)]
 			field(c, "预览解码", func() {
-				if ui.Select(c, &cur, hwLabels).Width(240).Changed() {
+				if ui.Select(c, &cur, hwLabels).Width(260).Changed() {
 					a.cfg.HWAccel = hwValues[max(indexOf(hwLabels, cur), 0)]
-					a.prev.hwFailed = false
+					a.prev.mode = ""
 					a.prev.seeked()
 					a.cfg.save()
 				}
 			})
-			ui.Text(c, "预览画面用 GPU 硬件解码（失败时自动回退 CPU）。导出始终直接复制视频流，不解码也不编码画面。").FontSize(11).TextColor(t.TextMuted)
+			ui.Text(c, "预览：NVIDIA 显卡上解码和缩放都在 GPU 上完成，只把 640×360 的小帧取回；不可用时依次回退 D3D11、CPU。当前："+media.DecodeLabel(a.prev.mode)+"。导出始终直接复制视频流，不解码也不编码画面。").FontSize(11).TextColor(t.TextMuted)
 			field(c, "缓存", func() {
 				ui.Text(c, media.CacheDir()).FontSize(11).TextColor(t.TextMuted).SingleLine().Grow(1).Tooltip(media.CacheDir())
 				ui.Button(c, "清理缓存").OnClick(a.clearCache)

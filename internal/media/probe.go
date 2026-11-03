@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -26,6 +27,9 @@ type Stream struct {
 	Height     int
 	FPS        float64
 	Picture    bool // an attached picture, as cover art
+	// Rotation is how far the picture turns clockwise to show upright, as
+	// phones record it: 0, 90, 180 or 270.
+	Rotation int
 }
 
 // Info is what ffprobe says about a file.
@@ -118,7 +122,10 @@ func Probe(ctx context.Context, path string) (*Info, error) {
 			Disposition   struct {
 				AttachedPic int `json:"attached_pic"`
 			} `json:"disposition"`
-			Tags map[string]string `json:"tags"`
+			Tags         map[string]string `json:"tags"`
+			SideDataList []struct {
+				Rotation float64 `json:"rotation"`
+			} `json:"side_data_list"`
 		} `json:"streams"`
 		Format struct {
 			FormatName string `json:"format_name"`
@@ -154,6 +161,12 @@ func Probe(ctx context.Context, path string) (*Info, error) {
 		}
 		if st.FPS == 0 {
 			st.FPS = rational(s.RFrameRate)
+		}
+		for _, sd := range s.SideDataList {
+			// ffprobe gives the display matrix's angle, clockwise.
+			if sd.Rotation != 0 {
+				st.Rotation = ((-int(math.Round(sd.Rotation)) % 360) + 360) % 360
+			}
 		}
 		info.Streams = append(info.Streams, st)
 	}

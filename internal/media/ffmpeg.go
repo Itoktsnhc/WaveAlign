@@ -150,13 +150,3 @@ func runErr(err error, t *tail) error {
 	}
 	return err
 }
-
-// hwaccelArgs turns a decoding preference into ffmpeg input options.
-func hwaccelArgs(mode string) []string {
-	switch mode {
-	case "", "none":
-		return nil
-	default:
-		return []string{"-hwaccel", mode}
-	}
-}

@@ -24,6 +24,7 @@ type source struct {
 	info    *media.Info
 	streams []media.Stream // its audio streams
 	stream  int            // the one used, an index into streams
+	want    int            // the absolute index asked for, until probed; -1 for the first
 	pcm     *media.PCM
 	peaks   *wave.Peaks
 
@@ -80,6 +81,7 @@ type clip struct {
 	lead float64
 
 	aligned    bool    // offset came from matching (and maybe nudged since)
+	manual     bool    // placed on the timeline by hand, unmatched
 	autoOffset float64 // what matching found
 	confidence float64
 	driftPPM   float64
@@ -93,6 +95,10 @@ type clip struct {
 }
 
 func (c *clip) end() float64 { return c.offset + c.duration() }
+
+// placed reports whether the clip is on the timeline: matched, or placed by
+// hand. Clips not yet matched wait in the sidebar.
+func (c *clip) placed() bool { return c.aligned || c.manual }
 
 // settings last from run to run.
 type settings struct {
@@ -162,7 +168,8 @@ type app struct {
 	extData []float32
 
 	// Timeline.
-	tl timeline
+	tl   timeline
+	held ui.Modifiers // the modifier keys held
 
 	// Playback.
 	playhead float64
@@ -184,7 +191,13 @@ type app struct {
 	exporting    bool
 	exportCancel func()
 	settingsOpen bool
-	ffmpegFound  string
+	conflictOpen bool
+	conflictList []conflict
+
+	projectPath string // where the project was saved or opened from
+	saved       string // the project as saved, to tell what changed
+	closing     bool   // the save prompt shows
+	ffmpegFound string
 
 	status    string
 	statusOK  bool
@@ -242,6 +255,7 @@ type projectClip struct {
 	Channel    int     `json:"channel"`
 	Offset     float64 `json:"offset"`
 	Aligned    bool    `json:"aligned"`
+	Placed     bool    `json:"placed,omitempty"`
 	AutoOffset float64 `json:"autoOffset"`
 	Confidence float64 `json:"confidence"`
 	DriftPPM   float64 `json:"driftPPM"`

@@ -26,6 +26,21 @@ func main() {
 			StateKey:  "main",
 			Content:   ui.View(a.view),
 		})
+		// Closing with unsaved changes asks to save the project first.
+		a.win.OnClose(func(e *mygo.CloseEvent) {
+			if a.dirty() {
+				e.PreventDefault()
+				a.confirmClose()
+				return
+			}
+			a.close()
+		})
+		mygo.App.OnBeforeQuit(func(e *mygo.QuitEvent) {
+			if a.dirty() {
+				e.PreventDefault()
+				a.confirmClose()
+			}
+		})
 	})
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)

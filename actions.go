@@ -70,6 +70,7 @@ func (a *app) addAudios(paths []string, saved []projectAudio) {
 		if saved != nil {
 			want = saved[i].Stream
 		}
+		it.want = want
 		a.audios = append(a.audios, it)
 		a.load(&it.source, want, nil)
 	}
@@ -84,16 +85,10 @@ func (a *app) addClips(paths []string, saved []projectClip) {
 		want := -1
 		if saved != nil {
 			s := saved[i]
-			want, c.channel, c.offset, c.aligned = s.Stream, s.Channel, s.Offset, s.Aligned
+			want, c.channel, c.offset, c.aligned, c.manual = s.Stream, s.Channel, s.Offset, s.Aligned, s.Placed
 			c.autoOffset, c.confidence, c.driftPPM = s.AutoOffset, s.Confidence, s.DriftPPM
-		} else if end := a.extEnd(); len(a.clips) > 0 {
-			// Until matched, place it after the last clip.
-			last := 0.0
-			for _, o := range a.clips {
-				last = max(last, o.end())
-			}
-			c.offset = min(last, end)
 		}
+		c.want = want
 		a.clips = append(a.clips, c)
 		if a.selected == 0 {
 			a.selected = c.id
@@ -231,14 +226,16 @@ func (a *app) extEnd() float64 {
 	return 0
 }
 
-// timeRange is the span the timeline shows and the mix plays.
+// timeRange is the span the timeline shows and the mix plays: from zero to
+// the end of the external audio or of the last video placed.
 func (a *app) timeRange() (float64, float64) {
-	lo, hi := 0.0, math.Max(a.extEnd(), 10)
+	hi := math.Max(a.extEnd(), 10)
 	for _, c := range a.clips {
-		lo = math.Min(lo, c.offset)
-		hi = math.Max(hi, c.end())
+		if c.placed() {
+			hi = math.Max(hi, c.end())
+		}
 	}
-	return lo, hi
+	return 0, hi
 }
 
 // sourcesChanged drops what depended on the files and their order.
@@ -466,8 +463,23 @@ func (a *app) alignClips(ids []int) {
 		}
 		a.post(func() {
 			a.setStatus(fmt.Sprintf("匹配完成：%d/%d 个视频成功", ok, len(jobs)), ok == len(jobs))
-			if c := a.selectedClip(); c != nil {
+			if c := a.selectedClip(); c != nil && c.placed() {
 				a.tl.reveal(c.offset, c.end())
+			}
+			// Matched clips that overlap share the one video lane: say so,
+			// and let the user decide which is right.
+			var mine []conflict
+			for _, k := range a.conflicts() {
+				for _, j := range jobs {
+					if k.a == j.c || k.b == j.c {
+						mine = append(mine, k)
+						break
+					}
+				}
+			}
+			if len(mine) > 0 {
+				a.conflictList = mine
+				a.conflictOpen = true
 			}
 		})
 	}()
@@ -483,7 +495,7 @@ func (a *app) params() playback.Params {
 func (a *app) segmentsB(origin float64) []playback.Segment {
 	var out []playback.Segment
 	for _, c := range a.clips {
-		if c.pcm == nil || a.onlySel && a.selected != 0 && c.id != a.selected {
+		if c.pcm == nil || !c.placed() || a.onlySel && a.selected != 0 && c.id != a.selected {
 			continue
 		}
 		out = append(out, playback.Segment{PCM: c.pcm, Start: int64(math.Round((c.offset + c.lead - origin) * playback.Rate))})
@@ -591,10 +603,19 @@ func (a *app) clipMoved() {
 
 // nudge moves the selected clip by d seconds.
 func (a *app) nudge(d float64) {
-	if c := a.selectedClip(); c != nil {
+	if c := a.selectedClip(); c != nil && c.placed() {
 		c.offset += d
 		a.clipMoved()
+		a.warnConflicts(c)
 	}
+}
+
+// placeAtPlayhead puts a clip that was not matched on the timeline, by hand.
+func (a *app) placeAtPlayhead(c *clip) {
+	c.offset, c.manual = a.playhead, true
+	a.selectClip(c.id)
+	a.clipMoved()
+	a.warnConflicts(c)
 }
 
 func secs(s float64) time.Duration { return time.Duration(s * float64(time.Second)) }
@@ -607,7 +628,7 @@ func (a *app) exportTargets() []*clip {
 		if a.exportScope == 1 && c.id != a.selected {
 			continue
 		}
-		if c.info == nil {
+		if c.info == nil || !c.placed() {
 			continue
 		}
 		if _, ok := c.info.Video(); !ok {
@@ -812,33 +833,115 @@ func (a *app) configureFFmpeg() {
 	a.ffmpegFound = mp
 }
 
-func (a *app) saveProject() {
+// snapshot is the project as Save writes it.
+func (a *app) snapshot() project {
 	p := project{Version: 1, Channel: a.channel}
+	stream := func(s *source) int {
+		if st, ok := s.audioStream(); ok {
+			return st.Index
+		}
+		return s.want
+	}
 	for _, it := range a.audios {
-		st, _ := it.audioStream()
-		p.Audios = append(p.Audios, projectAudio{Path: it.path, Stream: st.Index})
+		p.Audios = append(p.Audios, projectAudio{Path: it.path, Stream: stream(&it.source)})
 	}
 	for _, c := range a.clips {
-		st, _ := c.audioStream()
-		p.Clips = append(p.Clips, projectClip{Path: c.path, Stream: st.Index, Channel: c.channel, Offset: c.offset,
-			Aligned: c.aligned, AutoOffset: c.autoOffset, Confidence: c.confidence, DriftPPM: c.driftPPM})
+		p.Clips = append(p.Clips, projectClip{Path: c.path, Stream: stream(&c.source), Channel: c.channel,
+			Offset: c.offset, Aligned: c.aligned, Placed: c.manual, AutoOffset: c.autoOffset,
+			Confidence: c.confidence, DriftPPM: c.driftPPM})
 	}
+	return p
+}
+
+func (p project) json() []byte {
 	data, _ := json.MarshalIndent(p, "", "  ")
+	return data
+}
+
+// dirty reports whether the project changed since it was saved or opened.
+func (a *app) dirty() bool {
+	if len(a.audios) == 0 && len(a.clips) == 0 && a.projectPath == "" {
+		return false
+	}
+	return string(a.snapshot().json()) != a.saved
+}
+
+// saveProject saves the project where it was saved or opened from, unless
+// saveAs, and asks where otherwise; done, when set, runs on the main thread
+// once it is saved.
+func (a *app) saveProject(saveAs bool, done func()) {
+	data := a.snapshot().json()
+	path := a.projectPath
 	go func() {
-		path, err := mygo.Dialog.Save(mygo.SaveDialogOptions{Parent: a.win, Title: "保存工程", DefaultPath: "project.wavealign.json",
-			Filters: []mygo.FileFilter{projFilter}})
-		if err != nil || path == "" {
-			return
+		if saveAs || path == "" {
+			def := path
+			if def == "" {
+				def = "project.wavealign.json"
+			}
+			p, err := mygo.Dialog.Save(mygo.SaveDialogOptions{Parent: a.win, Title: "保存工程", DefaultPath: def,
+				Filters: []mygo.FileFilter{projFilter}})
+			if err != nil || p == "" {
+				return
+			}
+			path = p
 		}
-		err = os.WriteFile(path, data, 0o644)
+		err := os.WriteFile(path, data, 0o644)
 		a.post(func() {
 			if err != nil {
 				a.setStatus("保存失败: "+err.Error(), false)
-			} else {
-				a.setStatus("已保存工程 "+filepath.Base(path), true)
+				return
+			}
+			a.projectPath, a.saved = path, string(data)
+			a.setStatus("已保存工程 "+filepath.Base(path), true)
+			if done != nil {
+				done()
 			}
 		})
 	}()
+}
+
+// confirmClose asks whether to save a changed project before the window
+// closes, and closes it unless the user cancels.
+func (a *app) confirmClose() {
+	if a.closing {
+		return
+	}
+	a.closing = true
+	go func() {
+		res, err := mygo.Dialog.Message(mygo.MessageOptions{
+			Parent:        a.win,
+			Type:          mygo.MessageWarning,
+			Message:       "工程有未保存的修改，退出前保存吗？",
+			Detail:        "保存后可以用「打开工程」继续：文件顺序、音轨选择和对齐位置都会恢复。",
+			Buttons:       []string{"保存", "不保存", "取消"},
+			DefaultButton: 0,
+			CancelButton:  2,
+		})
+		a.post(func() {
+			a.closing = false
+			if err != nil {
+				return
+			}
+			switch res.Button {
+			case 0:
+				a.saveProject(false, a.quit)
+			case 1:
+				a.quit()
+			}
+		})
+	}()
+}
+
+// quit closes the window without asking again.
+func (a *app) quit() {
+	if a.exportCancel != nil {
+		a.exportCancel()
+	}
+	a.close()
+	a.saved = string(a.snapshot().json())
+	if a.win != nil {
+		a.win.Destroy()
+	}
 }
 
 func (a *app) openProject() {
@@ -858,6 +961,7 @@ func (a *app) openProject() {
 				return
 			}
 			a.loadProject(p)
+			a.projectPath, a.saved = paths[0], string(a.snapshot().json())
 			a.setStatus("已打开工程 "+filepath.Base(paths[0]), true)
 		})
 	}()

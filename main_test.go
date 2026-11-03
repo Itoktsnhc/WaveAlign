@@ -91,6 +91,11 @@ func TestApp(t *testing.T) {
 		"-ss", "41.2", "-t", "16", "-i", master,
 		"-map", "0:v", "-map", "1:a", "-af", "lowpass=f=2500,volume=0.5",
 		"-c:v", "libx264", "-preset", "ultrafast", "-c:a", "pcm_s16le", "-ac", "1", "-shortest", cam2)
+	// A third camera that filmed while camA did: the two overlap.
+	cam3 := filepath.Join(dir, "camC.mp4")
+	ffmpegRun(t, "-f", "lavfi", "-i", "testsrc2=d=10:s=640x360:r=30",
+		"-ss", "20", "-t", "10", "-i", master,
+		"-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest", cam3)
 
 	a := newApp()
 	a.queue = make(chan func(), 4096)
@@ -100,7 +105,7 @@ func TestApp(t *testing.T) {
 	snapshot(t, tt, "0-empty")
 
 	a.addAudios([]string{a1, a2}, nil)
-	a.addClips([]string{cam1, cam2}, nil)
+	a.addClips([]string{cam1, cam2, cam3}, nil)
 	ready := func() bool {
 		for _, it := range a.audios {
 			if it.loading || it.pcm == nil {
@@ -121,6 +126,10 @@ func TestApp(t *testing.T) {
 	if len(a.clips[0].streams) != 2 {
 		t.Fatalf("camA has %d audio streams", len(a.clips[0].streams))
 	}
+	// Not matched yet: no clip is on the timeline, which starts at zero.
+	if lo, hi := a.timeRange(); lo != 0 || math.Abs(hi-70) > 0.1 || len(a.placedClips()) != 0 {
+		t.Fatalf("timeline %.2f to %.2f with %d clips before matching", lo, hi, len(a.placedClips()))
+	}
 
 	if err := tt.Click("自动对齐全部"); err != nil {
 		t.Fatal(err)
@@ -133,7 +142,7 @@ func TestApp(t *testing.T) {
 		}
 		return true
 	})
-	for i, want := range []float64{12.5, 41.2} {
+	for i, want := range []float64{12.5, 41.2, 20} {
 		c := a.clips[i]
 		if c.err != "" {
 			t.Fatalf("%s: %s", c.name(), c.err)
@@ -143,11 +152,28 @@ func TestApp(t *testing.T) {
 		}
 		t.Logf("%s at %.5f, confidence %.2f, drift %.1f ppm", c.name(), c.offset, c.confidence, c.driftPPM)
 	}
+	// camC overlaps camA on the one video lane: the user is told, rather
+	// than given a lane of its own.
+	if !a.conflictOpen || len(a.conflictList) != 1 || len(a.conflicts()) != 1 {
+		t.Fatalf("conflict dialog %v with %d conflicts", a.conflictOpen, len(a.conflictList))
+	}
 	a.tl.fitPending = true
 	a.seek(20)
 	drain(t, a, tt, "preview", func() bool { return a.prev.has })
 	tt.Frame()
+	snapshot(t, tt, "1-conflict")
+	if err := tt.Click("知道了"); err != nil {
+		t.Fatal(err)
+	}
+	if a.conflictOpen {
+		t.Fatal("the conflict dialog stayed open")
+	}
+	tt.Frame()
 	snapshot(t, tt, "1-aligned")
+	a.saved = string(a.snapshot().json())
+	if a.dirty() {
+		t.Fatal("dirty right after saving")
+	}
 
 	// Nudge camA with the keys.
 	before := a.clips[0].offset
@@ -160,15 +186,68 @@ func TestApp(t *testing.T) {
 	if d := a.clips[0].offset - before; math.Abs(d-(1.0/30-0.001)) > 1e-9 {
 		t.Fatalf("Alt+← left the clip %.5f s off", d)
 	}
+	if !a.dirty() {
+		t.Fatal("nudging a clip left the project unchanged")
+	}
+
+	// The wheel zooms around the pointer, with or without Ctrl or Alt; the
+	// view never shows time below zero.
+	a.tl.fit()
+	tt.Frame()
+	box := a.tl.box
+	_, vlane, _ := a.lanes(box)
+	px := box.X + box.W/2
+	at := a.tl.t(px - box.X)
+	z := a.tl.pxPerSec
+	tt.Wheel(px, vlane.Y+10, 0, -notch)
+	if r := a.tl.pxPerSec / z; math.Abs(r-1.3) > 1e-6 {
+		t.Fatalf("a notch zoomed by %.4f", r)
+	}
+	if d := a.tl.t(px-box.X) - at; math.Abs(d) > 1e-6 {
+		t.Fatalf("the time under the pointer moved by %.6f s", d)
+	}
+	for _, mods := range []ui.Modifiers{ui.Ctrl, ui.Alt} {
+		tt.HoldModifiers(mods)
+		tt.Frame() // the tester's wheel carries no modifiers: the view reads them
+		z = a.tl.pxPerSec
+		tt.Wheel(px, vlane.Y+10, 0, -notch)
+		if r := a.tl.pxPerSec / z; math.Abs(r-1.3) > 1e-6 {
+			t.Fatalf("a notch with %v zoomed by %.4f", mods, r)
+		}
+	}
+	tt.HoldModifiers(ui.Shift)
+	tt.Frame()
+	start := a.tl.start
+	tt.Wheel(px, vlane.Y+10, 0, notch)
+	if a.tl.start <= start || math.Abs(a.tl.pxPerSec/z/1.3-1) > 1e-6 {
+		t.Fatalf("Shift+wheel moved the view from %.3f to %.3f", start, a.tl.start)
+	}
+	for range 50 {
+		// To the left, past the start. The tester's events reset the keys
+		// held, which the real backend sends with each.
+		tt.HoldModifiers(ui.Shift)
+		tt.Frame()
+		tt.Wheel(px, vlane.Y+10, 0, -notch)
+	}
+	tt.HoldModifiers(0)
+	tt.Frame()
+	if a.tl.start != 0 {
+		t.Fatalf("panned to %.3f, before zero", a.tl.start)
+	}
+	for range 40 {
+		tt.Wheel(box.X+5, vlane.Y+10, 0, notch) // zoom out, far
+	}
+	if a.tl.start < 0 || a.tl.pxPerSec < a.tl.minPxPerSec()-1e-9 {
+		t.Fatalf("zoomed out to %.4f DIPs/s from %.3f", a.tl.pxPerSec, a.tl.start)
+	}
 
 	// Drag camB's clip 60 DIPs to the right on the timeline.
-	a.tl.fit(0, 70)
+	a.tl.fit()
 	tt.Frame()
 	camB := a.clips[1]
 	from := camB.offset
-	lane := a.clipLane(1, a.tl.box)
 	x := a.tl.x(camB.offset+2, a.tl.box)
-	y := lane.Y + lane.H/2
+	y := vlane.Y + vlane.H/2
 	tt.Press(x, y)
 	tt.Move(x+30, y)
 	tt.Move(x+60, y)
@@ -195,9 +274,9 @@ func TestApp(t *testing.T) {
 	a.cfg.HWAccel = "cuda"
 	a.seek(14)
 	tt.Frame()
-	start := time.Now()
-	drain(t, a, tt, "playing", func() bool { return time.Since(start) > 1500*time.Millisecond })
-	t.Logf("playhead %.3f after 1.5 s from 14, %d frames shown, hardware failed %v", a.playhead, a.prev.shown, a.prev.hwFailed)
+	began := time.Now()
+	drain(t, a, tt, "playing", func() bool { return time.Since(began) > 1500*time.Millisecond })
+	t.Logf("playhead %.3f after 1.5 s from 14, %d frames shown, decoder %s", a.playhead, a.prev.shown, a.prev.mode)
 	if a.prev.shown < 20 {
 		t.Fatalf("only %d frames shown in 1.5 s of playback", a.prev.shown)
 	}
@@ -207,11 +286,13 @@ func TestApp(t *testing.T) {
 	}
 
 	// Zoom in on camA's start and look.
-	a.tl.fit(a.clips[0].offset-0.5, a.clips[0].offset+1.5)
+	a.tl.reveal(a.clips[0].offset-0.5, a.clips[0].offset+1.5)
 	tt.Frame()
 	snapshot(t, tt, "2-zoomed")
 
 	// Back to the matched place, and export both.
+	a.selectClip(a.clips[0].id)
+	tt.Frame()
 	if err := tt.Click("复位"); err != nil {
 		t.Fatal(err)
 	}

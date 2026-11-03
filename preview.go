@@ -10,8 +10,8 @@ import (
 	"wavealign/internal/media"
 )
 
-// The preview's frames: decoded by ffmpeg (on the GPU where it can), scaled
-// to this size, letterboxed.
+// The preview's frames: decoded by ffmpeg, on the GPU where it can, scaled to
+// this size, letterboxed.
 const (
 	prevW   = 640
 	prevH   = 360
@@ -30,10 +30,11 @@ type preview struct {
 		key       int64
 		path      string
 	}
-	has      bool   // a frame of the clip shown is in bmp
-	label    string // why there is none
-	hwFailed bool   // hardware decoding failed: decode in software
-	shown    int    // frames shown while playing, for tests
+	has   bool   // a frame of the clip shown is in bmp
+	label string // why there is none
+	// mode is the decoder that worked, once one has; "" until then.
+	mode  string
+	shown int // frames shown while playing
 }
 
 func (p *preview) init() {
@@ -61,7 +62,7 @@ func (p *preview) stop() {
 // playhead is in it, else the first under the playhead.
 func (a *app) previewClip() *clip {
 	in := func(c *clip) bool {
-		if c.info == nil || a.playhead < c.offset || a.playhead >= c.end() {
+		if !c.placed() || c.info == nil || a.playhead < c.offset || a.playhead >= c.end() {
 			return false
 		}
 		_, ok := c.info.Video()
@@ -78,11 +79,22 @@ func (a *app) previewClip() *clip {
 	return nil
 }
 
-func (a *app) hwaccel() string {
-	if a.prev.hwFailed {
-		return "none"
+// decoders returns the decoders to try: the one that worked, else the chain
+// the settings ask for.
+func (a *app) decoders() []string {
+	if a.prev.mode != "" {
+		return []string{a.prev.mode}
 	}
-	return a.cfg.HWAccel
+	return media.DecodeChain(a.cfg.HWAccel)
+}
+
+// frameOf describes the preview frames of a clip.
+func frameOf(c *clip) media.Frame {
+	f := media.Frame{W: prevW, H: prevH}
+	if v, ok := c.info.Video(); ok {
+		f.SrcW, f.SrcH, f.Rotation = v.Width, v.Height, v.Rotation
+	}
+	return f
 }
 
 // updatePreview starts decoding what the preview should show, from the view.
@@ -109,7 +121,7 @@ func (a *app) updatePreview() {
 		ctx, cancel := context.WithCancel(context.Background())
 		p.cancel = cancel
 		p.cur.clip, p.cur.gen, p.cur.streaming, p.cur.path = c.id, p.gen, true, c.path
-		a.streamFrames(ctx, c.id, c.path, local, c.offset)
+		a.streamFrames(ctx, c, local)
 		return
 	}
 	key := int64(local * prevFPS)
@@ -120,7 +132,7 @@ func (a *app) updatePreview() {
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 	p.cur.clip, p.cur.key, p.cur.path = c.id, key, c.path
-	id, path, hw := c.id, c.path, a.hwaccel()
+	id, path, f, modes := c.id, c.path, frameOf(c), a.decoders()
 	go func() {
 		// Wait for the scrubbing to rest a moment.
 		select {
@@ -128,11 +140,13 @@ func (a *app) updatePreview() {
 			return
 		case <-time.After(40 * time.Millisecond):
 		}
-		img, err := media.GrabFrame(ctx, path, float64(key)/prevFPS, prevW, prevH, hw)
-		if err != nil && hw != "none" && ctx.Err() == nil {
-			img, err = media.GrabFrame(ctx, path, float64(key)/prevFPS, prevW, prevH, "none")
-			if err == nil {
-				a.post(func() { p.hwFailed = true })
+		var img *image.RGBA
+		var err error
+		mode := ""
+		for _, mode = range modes {
+			img, err = media.GrabFrame(ctx, path, float64(key)/prevFPS, f, mode)
+			if err == nil || ctx.Err() != nil {
+				break
 			}
 		}
 		a.post(func() {
@@ -145,6 +159,7 @@ func (a *app) updatePreview() {
 			case img == nil:
 				p.has, p.label = false, "此处没有画面"
 			default:
+				p.mode = mode
 				p.bmp.Update(img)
 				p.has = true
 			}
@@ -153,10 +168,13 @@ func (a *app) updatePreview() {
 }
 
 // streamFrames decodes the clip from local on as it plays, and shows each
-// frame as the playhead reaches it.
-func (a *app) streamFrames(ctx context.Context, id int, path string, local, offset float64) {
+// frame as the playhead reaches it. A frame that comes late still shows if
+// none did for a while, so the picture keeps moving while the decoder
+// catches up; one that falls far behind starts decoding again from where the
+// playhead is.
+func (a *app) streamFrames(ctx context.Context, c *clip, local float64) {
 	p := &a.prev
-	hw := a.hwaccel()
+	id, path, offset, f, modes, gen := c.id, c.path, c.offset, frameOf(c), a.decoders(), p.gen
 	now := func() (float64, bool) {
 		cl := a.clock.Load()
 		if cl == nil {
@@ -166,6 +184,7 @@ func (a *app) streamFrames(ctx context.Context, id int, path string, local, offs
 	}
 	go func() {
 		k := 0
+		var lastShown time.Time
 		each := func(img *image.RGBA) bool {
 			at := local + float64(k)/prevFPS
 			k++
@@ -174,14 +193,24 @@ func (a *app) streamFrames(ctx context.Context, id int, path string, local, offs
 				if !ok || ctx.Err() != nil {
 					return false
 				}
-				if t >= at-0.5/prevFPS {
-					if t-at > 0.25 {
-						return true // late: drop it
+				if late := t - at; late > -0.5/prevFPS {
+					if late > 1.5 {
+						// Far behind: start again where the playhead is.
+						a.post(func() {
+							if p.cur.gen == gen {
+								p.seeked()
+							}
+						})
+						return false
+					}
+					if late > 0.1 && time.Since(lastShown) < 120*time.Millisecond {
+						return true // late, and one showed just now: skip it
 					}
 					break
 				}
 				time.Sleep(min(time.Duration((at-t)*float64(time.Second)), 10*time.Millisecond))
 			}
+			lastShown = time.Now()
 			a.post(func() {
 				if ctx.Err() == nil && p.cur.clip == id {
 					p.bmp.Update(img)
@@ -191,10 +220,19 @@ func (a *app) streamFrames(ctx context.Context, id int, path string, local, offs
 			})
 			return true
 		}
-		err := media.StreamFrames(ctx, path, local, prevW, prevH, prevFPS, hw, each)
-		if err != nil && k == 0 && hw != "none" && ctx.Err() == nil {
-			a.post(func() { p.hwFailed = true })
-			err = media.StreamFrames(ctx, path, local, prevW, prevH, prevFPS, "none", each)
+		var err error
+		for _, mode := range modes {
+			var n int
+			n, err = media.StreamFrames(ctx, path, local, f, prevFPS, mode, each)
+			if n > 0 || err == nil {
+				if n > 0 {
+					a.post(func() { p.mode = mode })
+				}
+				break
+			}
+			if ctx.Err() != nil {
+				return
+			}
 		}
 		if err != nil && ctx.Err() == nil {
 			a.post(func() { p.has, p.label = false, "无法解码画面: "+err.Error() })
